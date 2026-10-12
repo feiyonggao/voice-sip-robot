@@ -1,0 +1,97 @@
+; ============================================================
+; Voice SIP Robot 默认配置文件
+; ============================================================
+; 使用方式：
+;   1. 按需修改下方参数（SIP 账号、阿里模型端点等）
+;   2. 密钥可通过下方字段或环境变量提供（优先级：环境变量 > 配置文件）
+;      - DASHSCOPE_API_KEY：阿里 DashScope API Key
+;      - QWENBOT_SIP_PASSWORD：SIP 注册密码
+;      【建议】生产环境使用环境变量，避免密钥明文落盘
+;   3. 启动方式：
+;      GUI:     ./bin/voicebot
+;      无头模式: ./bin/voicebot --headless
+;      指定配置: ./bin/voicebot --headless --config /path/to/voicebot.ini
+;      环境变量: export VOICEBOT_CONFIG=/path/to/voicebot.ini
+; ============================================================
+
+[sip]
+; SIP 监听地址，生产环境建议 0.0.0.0（多网卡环境填具体 IP 会导致回包路径断裂）
+listenAddress = 0.0.0.0
+; SIP 信令端口
+port = 5060
+; RTP 起始端口（需预留 maxCalls × 2 个连续端口）
+rtpPort = 40000
+; 最大并发通话数（上限 180）
+maxCalls = 4
+; 允许接入的对端 IP（FreeSWITCH/PBX 源 IP），逗号分隔，支持 CIDR 网段
+allowedPeers = 127.0.0.1
+; 自动应答
+autoAnswer = true
+; 本机 SIP 标识
+identity = sip:robot@localhost
+; 注册服务器（留空则免注册模式，仅按白名单接受入站呼叫）
+; 格式：sip:host:port，用户名单独填在下方 user 字段，不可嵌入 URI
+registrar =
+; 认证用户名（registrar 非空时必填）
+user =
+; SIP 注册密码（可选，建议通过环境变量 QWENBOT_SIP_PASSWORD 提供以避免明文落盘）
+password =
+
+[qwen]
+; 阿里 Qwen 实时模型 WSS 端点（scheme 必须为 wss://）
+; 公共实例示例：wss://dashscope.aliyuncs.com/api/v1/services/aigc/realtime?model=qwen-audio-3.1-realtime-plus
+; 专属实例需替换为业务空间提供的完整 URL
+endpoint =
+; API Key（可选，建议通过环境变量 DASHSCOPE_API_KEY 提供以避免明文落盘）
+apiKey =
+; 音色
+voice = longanqian_v3.1
+; 系统指令（支持 {{X-Custom-Name}} 占位符，按 INVITE 自定义头替换）
+instructions = 你是电话语音助手，使用中文，回答简短自然，每次只问一个问题。当用户明确道别、表示不再需要帮助，或本次任务已完成时，先向用户简短道别，然后调用 hang_up 工具挂断电话。
+; 开场白（接通后自动播报）
+greeting = 请简短问候来电用户，并询问有什么可以帮助的。
+; 轮次检测模式：smart_turn（推荐）或 server_vad
+turnMode = smart_turn
+; 模型上下文携带的历史问答轮次上限（1-50）
+maxHistoryTurns = 20
+; 上行音频分片时长（毫秒），默认 20ms
+uplinkChunkMs = 20
+
+[interaction]
+; 无声超时秒数（1-60）
+silenceTimeoutSec = 6
+; 最大无声超时次数（达到后播放挂机话术并挂断）
+maxSilenceRetries = 3
+; 最大对话轮次（达到后强制挂断）
+maxTurns = 40
+; 允许用户打断（抢话）：开启时全双工，关闭时播放期间麦克风静默防回声
+allowBargeIn = true
+; 无声提示话术
+silencePrompt = 对方长时间没有说话，请简短询问对方是否还在听。
+; 挂机道别话术
+farewellPrompt = 请用一句话简短道别，告知对方即将结束通话。
+
+[record]
+; 通话记录文件路径（相对路径基于程序目录，留空使用默认）
+callRecordPath = cdr/calls.jsonl
+; 通话记录 Webhook 回调 URL（可选，通话结束异步 POST 完整记录 JSON）
+callRecordWebhook =
+; 单个通话记录文件最大字节数（默认 10MB）
+callRecordMaxSize = 10485760
+; 轮转保留的旧文件份数（默认 5）
+callRecordMaxFiles = 5
+; 自定义变量头（用于提示词变量注入，逗号分隔）
+customVariables = X-Custom-*
+
+[log]
+; 运行日志文件路径（相对路径基于程序目录，留空禁用文件日志）
+path = log/voicebot.log
+; 单个日志文件最大字节数（默认 10MB）
+maxSize = 10485760
+; 轮转保留的旧文件份数（默认 5）
+maxFiles = 5
+
+[tools]
+; 启用的 MCP 插件文件名（位于 plugins 目录，逗号分隔，留空禁用）
+; 可用插件：weather_mcp.py（天气查询）、ip_lookup_mcp.py（IP 归属地查询）
+enabledPlugins =
