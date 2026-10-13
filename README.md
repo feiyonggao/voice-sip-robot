@@ -29,6 +29,14 @@ FreeSWITCH/PBX ──SIP/RTP──► PJSIP（pjsua2）
 - **通话记录**：JSONL 含逐句对话转写 + Token 用量统计、Webhook 回调
 - **跨平台**：Windows / Linux（GUI + 无头模式）
 
+
+<img width="1696" height="1372" alt="image" src="https://github.com/user-attachments/assets/05b4946d-e507-4a29-a350-99463bc7f92a" />
+
+<img width="1223" height="753" alt="image" src="https://github.com/user-attachments/assets/cd784b74-ce46-4724-914f-c49d2573b605" />
+
+<img width="1231" height="776" alt="image" src="https://github.com/user-attachments/assets/6bf8b3e2-6b52-4bcf-a726-c7fffa5a5dc1" />
+
+
 ## 下载预编译包（推荐，免编译）
 
 从 [Releases](../../releases) 页面下载对应平台的安装包：
