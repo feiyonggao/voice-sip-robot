@@ -30,11 +30,10 @@ FreeSWITCH/PBX ──SIP/RTP──► PJSIP（pjsua2）
 - **跨平台**：Windows / Linux（GUI + 无头模式）
 
 
-<img width="1696" height="1372" alt="image" src="https://github.com/user-attachments/assets/05b4946d-e507-4a29-a350-99463bc7f92a" />
+<img width="1696" height="1372" alt="image" src="https://github.com/user-attachments/assets/05b4946d-e507-4a29-a350-99463bc7f92a" />  <img width="1223" height="753" alt="image" src="https://github.com/user-attachments/assets/cd784b74-ce46-4724-914f-c49d2573b605" />
 
-<img width="1223" height="753" alt="image" src="https://github.com/user-attachments/assets/cd784b74-ce46-4724-914f-c49d2573b605" />
+<img width="1231" height="776" alt="image" src="https://github.com/user-attachments/assets/6bf8b3e2-6b52-4bcf-a726-c7fffa5a5dc1" /> <img width="1200" height="695" alt="image" src="https://github.com/user-attachments/assets/bd6afe09-afdd-47d6-a86e-0d502ce9e599" />
 
-<img width="1231" height="776" alt="image" src="https://github.com/user-attachments/assets/6bf8b3e2-6b52-4bcf-a726-c7fffa5a5dc1" />
 
 
 ## 下载预编译包（推荐，免编译）
