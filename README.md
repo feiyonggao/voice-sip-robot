@@ -29,6 +29,13 @@ FreeSWITCH/PBX ──SIP/RTP──► PJSIP（pjsua2）
 - **通话记录**：JSONL 含逐句对话转写 + Token 用量统计、Webhook 回调
 - **跨平台**：Windows / Linux（GUI + 无头模式）
 
+
+<img width="49%" alt="配置页" src="docs/images/screenshot-config.png" /> <img width="49%" alt="通话与转写" src="docs/images/screenshot-calls.png" />
+
+<img width="49%" alt="日志页" src="docs/images/screenshot-logs.png" /> <img width="49%" alt="工具页" src="docs/images/screenshot-tools.png" />
+
+
+
 ## 下载预编译包（推荐，免编译）
 
 从 [Releases](../../releases) 页面下载对应平台的安装包：
@@ -83,6 +90,26 @@ pip install "mcp[cli]<2" httpx
 [tools]
 enabledPlugins = weather_mcp.py, ip_lookup_mcp.py
 ```
+
+## 使用方式
+
+### 1. SIP 模式
+
+**本地已注册 SIP 账号**：voicebot 已在上游 FreeSWITCH/PBX 注册，由上游发起呼叫：
+
+```
+originate {absolute_codec_string=PCMA}sofia/gateway/用户手机号 &bridge(user/sip账号)
+```
+
+**本地无 SIP 注册账号**（免注册模式）：
+
+```
+originate {absolute_codec_string=PCMA}sofia/gateway/用户手机号 &bridge(sofia/external/xxx@ip)
+```
+
+### 2. 本地对话模式
+
+填写阿里大模型信息后，直接点击右上角「开始本地对话」，即可与机器人进行交互。
 
 ## 从源码构建
 
