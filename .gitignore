@@ -112,6 +112,8 @@ CLAUDE.md
 voicebot-acceptance.md
 *.log
 !pjsip-apps/src/voicebot/**/*.py
+# 真实运行配置（含 SIP 密码/API Key/WorkspaceId），只提交 .default 模板
+pjsip-apps/src/voicebot/**/voicebot.ini
 pjsip-apps/src/voicebot/**/cdr/
 pjsip-apps/src/voicebot/**/log/
 pjsip-apps/src/voicebot/**/__pycache__/
