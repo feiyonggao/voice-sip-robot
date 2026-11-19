@@ -42,7 +42,7 @@ FreeSWITCH/PBX ──SIP/RTP──► PJSIP（pjsua2）
 
 ### Windows
 
-1. 下载 `voicebot-1.0.0-win64.zip`，解压到任意目录
+1. 下载 `voicebot-1.1.0-win64.zip`，解压到任意目录
 2. 复制 `voicebot.ini.default` 为 `myconfig.ini`，修改配置项
 3. 设置密钥环境变量，运行：
 
@@ -57,7 +57,7 @@ $env:QWENBOT_SIP_PASSWORD = "your-password"
 
 ### Linux
 
-1. 下载 `voicebot-1.0.0-Linux.tar.gz`，解压到任意目录
+1. 下载 `voicebot-1.0.0-Linux.tar.gz`，解压到任意目录（v1.1.0 暂未提供 Linux 包，可按[从源码构建](#从源码构建)自行编译）
 2. 安装 Qt6 运行库（Ubuntu 24.04 示例）：
 
 ```bash
