@@ -2,7 +2,10 @@
 
 #include "bot_config.h"
 #include "qwen_session.h"
+#include <QAudioDevice>
+#include <QAudioFormat>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QJsonArray>
 #include <QMutex>
 #include <QObject>
@@ -17,10 +20,16 @@ class QIODevice;
 
 namespace qwenbot {
 
+class AecProcessor;
 class QwenSession;
 
 // 本地测试对话：麦克风 16k 采集 → QwenSession，模型 24k 输出 → 本地扬声器播放。
 // 不经过 SIP/RTP，也不写通话记录。所有方法与信号都在所属线程事件循环上运行。
+//
+// 播放采用拉取（pull）模式：把自定义 QIODevice 交给 sink->start(pullDev)，
+// 音频后端线程主动 readData() 取数据，队列空时静音补齐。Qt6 FFmpeg 后端的
+// 推/拉模式均有停摆缺陷；WASAPI 后端（QT_MEDIA_BACKEND=windows）原生为
+// 事件驱动拉取，与拉取模式匹配，实测稳定。停摆/打断统一销毁重建 sink 恢复。
 class LocalAudioSession : public QObject {
     Q_OBJECT
 public:
@@ -50,53 +59,70 @@ signals:
     // 模型请求调用 MCP 工具：由主线程路由到 ToolRegistry，结果回调 completeToolCall
     void toolCallRequested(const QString &callId, const QString &name,
                            const QString &arguments);
+    // 输入设备疑似回环/虚拟设备（会采集系统播放声），界面需要醒目提示
+    void deviceWarning(const QString &text);
 
 public slots:
     // 主线程把 MCP 工具结果送回（排队到音频工作线程）
     void completeToolCall(const QString &callId, const QString &outputJson);
 
 private slots:
-    void pumpUplink();
-    void monitorPlayback(); // 看门狗：队列有数据但后端停止拉取时重启扬声器
+    void pumpUplink();    // 20ms：麦克风 → AEC → 上行
+    void pumpDownlink();  // 20ms：预缓冲起播 + 停摆看门狗（播放由后端线程拉取）
+    void monitorPlayback(); // 100ms：播放排空后驱动无声计时/挂机策略
     void checkFinished();
-    void primeSink();
 
 private:
     void playAudio(const QByteArray &pcm24k);
     void handleInterrupted();
+    QAudioSink *createSink(const QAudioDevice &device, const QAudioFormat &format);
     void beginFinish(const QString &reason);
-    void hardRestartSink(); // stop()+start() 恢复停摆的扬声器
-    bool modelSpeaking() const; // 队列有待播音频或设备仍在播放/尾音冷却
+    bool modelSpeaking() const; // 队列有待播音频或设备缓冲仍在放音/尾音冷却
     bool playbackIdle() const;  // 播放已静止：FIFO 空且超过尾音时长无拉取
     qint64 queueBytes() const;  // FIFO 当前字节数（线程安全）
-    qint64 pullFromQueue(char *data, qint64 maxSize); // 音频后端线程调用
+    // 音频后端线程调用：从 FIFO 取数据（可能不足 maxSize，调用方静音补齐）
+    qint64 pullFromQueue(char *data, qint64 maxSize);
 
     std::unique_ptr<QwenSession> session_;
     QAudioSource *source_ = nullptr;
     QIODevice *srcDev_ = nullptr;
     QAudioSink *sink_ = nullptr;
-    QIODevice *pullDev_ = nullptr; // 只读拉取设备：后端线程经 readData() 取数据
+    QIODevice *pullDev_ = nullptr; // 拉取模式播放设备（成员常驻，sink 重建不影响）
+    bool sinkStarted_ = false;     // 拉取会话是否已 start
+    int prefillBytes_ = 7200;      // 起播预缓冲（150ms @24k）：吸收首个网络抖动
+    QAudioDevice outputDevice_;   // 重建 QAudioSink 需复用同一输出设备/格式
+    QAudioFormat outputFormat_;
     // 必须以 this 为父对象：本对象在 GUI 线程构造后 moveToThread 到音频工作线程，
     // 无父对象的成员 QTimer 会留在 GUI 线程，在工作线程 start() 会被 Qt 静默拒绝
     // （"Timers cannot be started from another thread"），上行采集/看门狗将全部失效。
     QTimer uplinkTimer_{this};
+    QTimer downlinkTimer_{this};  // 20ms 推模式写入
     QTimer monitorTimer_{this};   // 100ms 看门狗
     QTimer finishTimer_{this};
-    QTimer prefillTimer_{this};   // 首包到达后限时启动扬声器，保证短响应也能开播
     QElapsedTimer finishDeadline_;
     QElapsedTimer playbackClock_;
     QByteArray uplinkBuf_;
     mutable QMutex queueMutex_;
-    QByteArray pcmQueue_;   // 下行 FIFO：后端线程拉取播放，本线程只入队
+    QByteArray pcmQueue_;   // 下行 FIFO：pumpDownlink 按设备可用空间写入
     int chunkBytes_ = 640;
-    int prefillBytes_ = 19200; // 约 400ms@24kHz16bit
     bool finishing_ = false;
-    bool sinkPrimed_ = false;  // 扬声器是否已启动
     bool lastSpeakingLogged_ = false; // 半双工状态切换日志去重
-    bool allowBargeIn_ = true; // 允许抢话：播放期间也上送麦克风（全双工），否则半双工静默
+    qint64 uplinkBytesDuringPlay_ = 0; // 本轮播报期间实际发送的上行字节数（全双工取证）
+    bool allowBargeIn_ = true; // 与 SIP 语义一致：勾选=全双工（始终上行），未勾选=半双工（播放期间静音）
+    // 客户端回声消除：仅全双工时启用。参考信号 = 写入扬声器的播放 PCM，
+    // 参考消费按麦克风节拍推进，参考缓冲水位自动跟踪设备缓冲深度。
+    std::unique_ptr<AecProcessor> aec_;
+    QByteArray aecReferenceMirror_;
+    mutable QMutex aecRefMutex_;
+    QElapsedTimer aecStatsClock_;
     std::atomic<bool> sinkHadData_{false};
-    std::atomic<qint64> lastPullMs_{-10000}; // 后端最近一次拉取音频的时刻
-    qint64 lastRestartMs_ = -10000;  // 最近一次重启扬声器的时刻，防止重启风暴
+    std::atomic<qint64> lastPullMs_{-10000}; // 最近一次后端线程拉走音频的时刻（含静音补齐）
+    qint64 lastInterruptMs_ = -10000; // 最近一次打断时刻：残余回声防护窗口计时基准
+    // 诊断录音：上行原始（AEC 前）与实际上行（AEC 后）各录一份 WAV，用于定位识别差
+    QFile debugNearFile_;
+    QFile debugUplinkFile_;
+    qint64 debugNearBytes_ = 0;
+    qint64 debugUplinkBytes_ = 0;
     QString finishReason_;
     QString lastError_;
 };

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(voicebot VERSION 1.0.0 LANGUAGES C CXX)
+project(voicebot VERSION 1.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
@@ -22,19 +22,27 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
 add_library(voicebot-core STATIC
+  aec_processor.h aec_processor.cpp
   bot_config.h bot_config.cpp
   bot_engine.h bot_engine.cpp
   call_record.h call_record.cpp
   file_logger.h file_logger.cpp
   local_audio.h local_audio.cpp
   mcp_client.h mcp_client.cpp
+  mcp_plugin.h mcp_plugin.cpp
+  mcp_transport.h mcp_transport.cpp
   pcm_bridge.h pcm_bridge.cpp
   qwen_session.h qwen_session.cpp
   tool_registry.h tool_registry.cpp
 )
 target_link_libraries(voicebot-core PUBLIC Qt6::Core Qt6::Network Qt6::WebSockets Qt6::Multimedia
-  pjsua2 pjsua-lib pjsip pjmedia pjlib pjlib-util pjnath)
-target_include_directories(voicebot-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+  pjsua2 pjsua-lib pjsip pjmedia pjlib pjlib-util pjnath speex)
+# 本地对话客户端回声消除用 pjproject 已捆绑的 SpeexDSP（无新增第三方依赖）。
+# 头文件来自 third_party/speex/include 与生成的 third_party/build/speex。
+target_include_directories(voicebot-core PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "${CMAKE_CURRENT_LIST_DIR}/../../../third_party/speex/include"
+  "${CMAKE_CURRENT_LIST_DIR}/../../../third_party/build/speex")
 
 # Windows 下把应用图标嵌入 exe 资源（任务栏/资源管理器显示）
 if(WIN32)

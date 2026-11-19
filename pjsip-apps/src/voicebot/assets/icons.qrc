@@ -1,5 +1,9 @@
 <RCC>
     <qresource prefix="/icons">
         <file alias="app.png">icon.png</file>
+        <file alias="chevron-down.svg">chevron-down.svg</file>
+        <file alias="chevron-up.svg">chevron-up.svg</file>
+        <file alias="chevron-down-disabled.svg">chevron-down-disabled.svg</file>
+        <file alias="chevron-up-disabled.svg">chevron-up-disabled.svg</file>
     </qresource>
 </RCC>

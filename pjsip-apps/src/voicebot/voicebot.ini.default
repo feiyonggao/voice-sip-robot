@@ -38,9 +38,16 @@ user =
 password =
 
 [qwen]
-; 阿里 Qwen 实时模型 WSS 端点（scheme 必须为 wss://）
-; 公共实例示例：wss://dashscope.aliyuncs.com/api/v1/services/aigc/realtime?model=qwen-audio-3.1-realtime-plus
-; 专属实例需替换为业务空间提供的完整 URL
+; 阿里云百炼业务空间 ID（WorkspaceId），只填 ID 本身（如 llm-xxxxxxxx）
+workspaceId =
+; 业务空间所在地域：cn-beijing（华北2·北京，默认）/ ap-southeast-1（新加坡）
+region = cn-beijing
+; 实时语音模型：qwen-audio-3.1-realtime-flash / qwen-audio-3.1-realtime-plus
+model = qwen-audio-3.1-realtime-plus
+; 端点由程序拼装：wss://{workspaceId}.{region}.maas.aliyuncs.com/api-ws/v1/realtime?model={model}
+; 高级兜底：manualEndpoint=true 时忽略上面三项，直接使用 endpoint（scheme 必须为 wss://）
+manualEndpoint = false
+; 旧版完整端点；非手动模式下由程序按 workspaceId + region + model 自动覆盖
 endpoint =
 ; API Key（可选，建议通过环境变量 DASHSCOPE_API_KEY 提供以避免明文落盘）
 apiKey =
@@ -92,6 +99,21 @@ maxSize = 10485760
 maxFiles = 5
 
 [tools]
-; 启用的 MCP 插件文件名（位于 plugins 目录，逗号分隔，留空禁用）
+; 插件名称列表（顺序即启动顺序），本地脚本与远端服务可混用。
+; 每个插件的传输方式在下方对应分组中配置，缺省 transport=stdio（本机脚本）。
+plugins =
+; 默认 stdio（本机脚本）示例：
+; [tools/plugin/weather_mcp.py]
+; transport = stdio
+; HTTP 远端 MCP 服务示例（请求头值支持 ${环境变量名}，运行时展开，避免密钥明文落盘）：
+; [tools/plugin/remote-weather]
+; transport = http
+; url = https://example.com/mcp
+; headers = Authorization: Bearer ${MCP_TOKEN}
+; 旧格式（仍兼容读取，自动视为 stdio）：启用的 MCP 插件文件名（位于 plugins 目录，逗号分隔）
 ; 可用插件：weather_mcp.py（天气查询）、ip_lookup_mcp.py（IP 归属地查询）
 enabledPlugins =
+; 工具级禁用名单（工具名列表，空 = 全部启用）。只影响下一次通话的工具集，
+; 进行中的通话仍使用开始时的快照。GUI 在「配置 → 工具启用」中维护。
+; 兼容旧配置：缺少该键时视为全部启用。
+disabledTools =

@@ -55,9 +55,21 @@ signals:
     void toolCallRequested(const QString &callId, const QString &name, const QString &arguments);
     void diagLog(const QString &text); // [debug-point] 服务端事件诊断
 
+#ifdef VOICEBOT_TESTING
+public:
+    struct Impl; // 实现细节（仅测试 harness 需要具名访问）
+#else
 private:
     struct Impl;
+#endif
+private:
     std::unique_ptr<Impl> impl_;
+
+#ifdef VOICEBOT_TESTING
+public:
+    // 仅供离线 harness 直接投递服务端事件（生产构建不定义该宏）
+    Impl *implForTest() { return impl_.get(); }
+#endif
 };
 
 } // namespace qwenbot

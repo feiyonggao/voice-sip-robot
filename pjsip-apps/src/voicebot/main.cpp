@@ -67,6 +67,15 @@ int main(int argc, char *argv[])
     //强制 Qt 网络栈仅使用 IPv4（QWebSocket 无公开的 IP 族控制 API）。
     //SIP/RTP 走 PJSIP 自带网络栈，本就是 IPv4-only，不受影响。
     qputenv("QT_NO_IPV6", "1");
+#ifdef Q_OS_WIN
+    // Qt6 默认 FFmpeg 多媒体后端的 QAudioSink/QAudioSource 在 Windows 上不稳定：
+    // 推/拉两种模式实测都会播放停摆（缓冲写满后不再消费，bytesFree 恒 0，
+    // 表现为“说着说着没声音”）。切回 Qt 原生 Windows 后端（WASAPI，
+    // Qt5/6.4 时代一直使用的稳定实现）。必须在任何 Qt Multimedia 对象创建前设置。
+    // 外部已通过环境变量显式指定时不覆盖。
+    if (qEnvironmentVariableIsEmpty("QT_MEDIA_BACKEND"))
+        qputenv("QT_MEDIA_BACKEND", "windows");
+#endif
     bool headless = false;
     bool commandHelp = false;
     for (int index = 1; index < argc; ++index) {
@@ -106,11 +115,20 @@ int main(int argc, char *argv[])
         "--config 指定非敏感 INI 文件，亦可在 GUI 中编辑和保存。\n"
         "[sip]: listenAddress, port, rtpPort, maxCalls, allowedPeers, autoAnswer,\n"
         "       identity, registrar, user\n"
-        "[qwen]: endpoint, voice, instructions, greeting, turnMode\n"
-        "[tools]: enabledPlugins（启用的插件文件名，逗号分隔；插件位于打包的 plugins 目录，留空禁用）\n"
+        "[qwen]: workspaceId, region, model, manualEndpoint, endpoint, voice, instructions, greeting, turnMode\n"
+        "[tools]: plugins（插件名称列表，本地脚本与远端服务可混用）\n"
+        "         每插件在 [tools/plugin/<名称>] 配置 transport=stdio/http、url、headers（可选）\n"
+        "         旧格式 enabledPlugins（启用的插件文件名，逗号分隔）自动视为 stdio；\n"
+        "         disabledTools（工具名列表，可选）只从下一次通话的工具集中剔除，\n"
+        "         进行中的通话继续使用开始时的快照；缺省视为全部启用。\n"
+        "         插件位于打包的 plugins 目录，留空禁用\n"
         "allowedPeers 使用逗号分隔的 IPv4 地址；autoAnswer 为 true/false。\n"
-        "endpoint 必须是工作空间提供的完整 WSS 端点，不含密钥；\n"
-        "model 参数固定为 qwen-audio-3.1-realtime-plus。\n"
+        "实时语音端点由 workspaceId + region + model 自动拼装：\n"
+        "wss://{workspaceId}.{region}.maas.aliyuncs.com/api-ws/v1/realtime?model=...\n"
+        "region 可选 cn-beijing（默认）/ ap-southeast-1；model 可选\n"
+        "qwen-audio-3.1-realtime-flash / plus；manualEndpoint=true 时直接使用 endpoint。\n"
+        "旧的完整 endpoint 会自动解析出 workspaceId/region/model，解析不出则转为手动端点。\n"
+        "endpoint 保留完整 WSS 端点写法，不含密钥。\n"
         "不指定 --config 时使用当前用户的 QSettings 配置。"));
     parser.addHelpOption();
     parser.addVersionOption();
@@ -185,7 +203,8 @@ int main(int argc, char *argv[])
             printError(withoutSecrets(text, config));
         });
         engine.setToolRegistry(registry.get());
-        registry->applyMcpCommands(config.mcpCommands);
+        registry->setDisabledTools(config.disabledTools);
+        registry->applyMcpPlugins(config.mcpPlugins);
         // 等待各插件完成首次工具发现（最多 5 秒，超时照常启动，插件继续后台重试）
         QElapsedTimer discovery;
         discovery.start();
@@ -341,7 +360,7 @@ int main(int argc, char *argv[])
         background-color: #ffffff;
         border: 1px solid #d7dae0;
         border-radius: 8px;
-        padding: 7px 11px;
+        padding: 7px 6px 7px 11px;
         selection-background-color: #c7d2fe;
         selection-color: #1e1b4b;
     }
@@ -354,20 +373,52 @@ int main(int argc, char *argv[])
         color: #9ca3af;
         border-color: #e5e7eb;
     }
-    QSpinBox { padding: 7px 2px 7px 8px; }
-    QSpinBox::up-button, QSpinBox::down-button {
-        background-color: transparent;
-        border: none;
+    QSpinBox { padding: 7px 4px 7px 8px; }
+    QSpinBox::up-button {
+        subcontrol-origin: border;
+        subcontrol-position: top right;
         width: 20px;
+        margin: 1px 1px 0 0;
+        border-left: 1px solid #e5e7eb;
+        border-bottom: 1px solid #e5e7eb;
+        border-top-right-radius: 7px;
+        background-color: #f8fafc;
     }
-    QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #eef2ff; }
-    QComboBox { padding: 7px 2px 7px 8px; }
+    QSpinBox::down-button {
+        subcontrol-origin: border;
+        subcontrol-position: bottom right;
+        width: 20px;
+        margin: 0 1px 1px 0;
+        border-left: 1px solid #e5e7eb;
+        border-bottom-right-radius: 7px;
+        background-color: #f8fafc;
+    }
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+        background-color: #eef2ff;
+        border-left-color: #c7d2fe;
+    }
+    QSpinBox::up-button:pressed, QSpinBox::down-button:pressed { background-color: #c7d2fe; }
+    QSpinBox::up-button:disabled, QSpinBox::down-button:disabled {
+        background-color: #f3f4f6;
+        border-left-color: #e5e7eb;
+    }
+    QSpinBox::up-arrow { image: url(:/icons/chevron-up.svg); width: 9px; height: 9px; }
+    QSpinBox::down-arrow { image: url(:/icons/chevron-down.svg); width: 9px; height: 9px; }
+    QSpinBox::up-arrow:off, QSpinBox::up-arrow:disabled { image: url(:/icons/chevron-up-disabled.svg); }
+    QSpinBox::down-arrow:off, QSpinBox::down-arrow:disabled { image: url(:/icons/chevron-down-disabled.svg); }
+    QComboBox { padding: 7px 4px 7px 8px; }
     QComboBox::drop-down {
         border: none;
         border-left: 1px solid #e5e7eb;
-        width: 26px;
+        width: 22px;
         subcontrol-origin: padding;
         subcontrol-position: center right;
+    }
+    /* 自定义 drop-down 后 Qt 不再绘制原生箭头，需显式给出图标，避免分隔线右侧成为空白 */
+    QComboBox::down-arrow {
+        image: url(:/icons/chevron-down.svg);
+        width: 10px;
+        height: 10px;
     }
     QComboBox QAbstractItemView {
         background-color: #ffffff;
@@ -401,7 +452,7 @@ int main(int argc, char *argv[])
         border: 1px solid #e7e9ef;
         border-radius: 12px;
         margin-top: 16px;
-        padding: 18px 18px 10px 18px;
+        padding: 18px 16px 10px 16px;
         font-weight: 700;
         color: #0f172a;
     }

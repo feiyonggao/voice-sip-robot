@@ -32,6 +32,7 @@ struct BotEngine::Impl {
         QString peer;
         bool closing = false, ready = false, confirmed = false;
         bool opening = false, pendingHangup = false;
+        bool recordWritten = false; // 通话记录只写一次（主动挂断与对端挂断共用）
         std::unique_ptr<QwenSession> session;
         std::unique_ptr<PcmBridge> bridge;
         QElapsedTimer age;
@@ -65,6 +66,8 @@ struct BotEngine::Impl {
                 if (info.state == PJSIP_INV_STATE_DISCONNECTED) {
                     auto c = o->find(key, identity);
                     if (!c) return;
+                    // 在 closing 被置位前判断挂断是否由本地发起（end()/自动结束/失败）
+                    const bool localHangup = c->closing;
                     c->closing = true;
                     c->sipStatusCode = info.lastStatusCode;
                     o->clearPendingTools(key);
@@ -72,10 +75,17 @@ struct BotEngine::Impl {
                         c->hangupReason = QString::fromStdString(info.lastReason);
                     }
                     if (c->hangupBy.isEmpty()) {
-                        // 根据 SIP 状态码推断挂断方
-                        c->hangupBy = (info.lastStatusCode == PJSIP_SC_OK || info.lastStatusCode == PJSIP_SC_DECLINE)
-                            ? QStringLiteral("callee") : QStringLiteral("caller");
+                        // 不依赖 lastStatusCode：远端 BYE 的最终状态码也是 200，会把对端挂断误判为 callee
+                        c->hangupBy = localHangup ? QStringLiteral("callee") : QStringLiteral("caller");
                     }
+                    if (!c->hangupTime.isValid())
+                        c->hangupTime = QDateTime::currentDateTime();
+                    if (!localHangup) {
+                        o->report(QStringLiteral("通话 %1：对端挂断（SIP %2，原因：%3）")
+                                      .arg(key).arg(c->sipStatusCode).arg(c->hangupReason));
+                    }
+                    // 对端挂断不经过 end()，必须在这里补写通话记录，否则 CDR/转写/usage 全部丢失
+                    o->finishCallRecord(c);
                     if (c->session) {
                         c->session->close();
                         c->session.release()->deleteLater();
@@ -261,6 +271,7 @@ struct BotEngine::Impl {
         record.callId = c->callId.isEmpty() ? QString::number(c->id) : c->callId;
         record.caller = c->callerNumber;
         record.callee = c->calleeNumber;
+        record.modelId = config.effectiveRealtimeModel();
         record.voice = config.voice;
         record.startTime = c->startTime;
         record.answerTime = c->answerTime;
@@ -280,6 +291,13 @@ struct BotEngine::Impl {
         record.callDurationMs = c->startTime.msecsTo(record.hangupTime);
         c->recorder->write(record);
     }
+    // 本地 end() 与对端 BYE（DISCONNECTED）共用的记录收尾，recordWritten 防重复写入
+    void finishCallRecord(const std::shared_ptr<Call> &c) {
+        if (c->recordWritten) return;
+        c->recordWritten = true;
+        if (!c->hangupTime.isValid()) c->hangupTime = QDateTime::currentDateTime();
+        writeCallRecord(c);
+    }
     void fail(const std::shared_ptr<Call> &c, const QString &text) {
         if (c->closing) return;
         report(QStringLiteral("通话 %1：%2").arg(c->id).arg(text));
@@ -289,6 +307,8 @@ struct BotEngine::Impl {
         if (c->closing) return;
         c->closing = true;
         c->hangupTime = QDateTime::currentDateTime();
+        // end() 只会在本地主动挂断（UI/自动结束/失败）时调用，挂断方固定为 callee
+        if (c->hangupBy.isEmpty()) c->hangupBy = QStringLiteral("callee");
         clearPendingTools(c->id);
         if (c->session) c->session->close();
         c->bridge.reset();
@@ -296,7 +316,7 @@ struct BotEngine::Impl {
         catch (const pj::Error &e) { report(QString::fromStdString(e.info())); }
         // 通话结束后写入记录（仅当已接听或明确拒绝时）
         if (c->answered || code != PJSIP_SC_RINGING)
-            writeCallRecord(c);
+            finishCallRecord(c);
     }
     void incoming(pj::OnIncomingCallParam &p) {
         try {
@@ -502,10 +522,21 @@ bool BotEngine::start(const BotConfig &config)
     const auto error = config.validate();
     if (!error.isEmpty()) { emit logMessage(error); emit statusChanged(error); return false; }
     d.config = config;
+    // 启动各阶段耗时诊断：用于定位按钮卡顿（日志中带毫秒）
+    QElapsedTimer startupTimer;
+    startupTimer.start();
+    qint64 startupMark = 0;
+    const auto logStartupPhase = [&](const QString &name) {
+        const qint64 now = startupTimer.elapsed();
+        emit logMessage(QStringLiteral("启动阶段 %1：%2 ms").arg(name).arg(now - startupMark));
+        startupMark = now;
+    };
     d.initRecorder();
+    logStartupPhase(QStringLiteral("配置与通话记录"));
     try {
         d.endpoint.libCreate();
         d.created = true;
+        logStartupPhase(QStringLiteral("PJSUA 库创建"));
         pj::EpConfig ep;
         ep.uaConfig.threadCnt = 0;
         ep.uaConfig.mainThreadOnly = true;
@@ -522,15 +553,19 @@ bool BotEngine::start(const BotConfig &config)
         ep.logConfig.consoleLevel = 0;
         ep.logConfig.msgLogging = false;
         d.endpoint.libInit(ep);
+        logStartupPhase(QStringLiteral("PJSUA 初始化"));
         pj::TransportConfig transport;
         transport.port = config.sipPort;
         transport.boundAddress = config.listenAddress.toStdString();
         const int transportId = d.endpoint.transportCreate(PJSIP_TRANSPORT_UDP, transport);
+        logStartupPhase(QStringLiteral("SIP 传输创建"));
         d.endpoint.libStart();
+        logStartupPhase(QStringLiteral("PJSUA 启动"));
         d.endpoint.audDevManager().setNullDev();
         for (const auto &codec : d.endpoint.codecEnum2())
             d.endpoint.codecSetPriority(codec.codecId, codec.codecId == "PCMA/8000/1" ? 255 :
                 codec.codecId == "PCMU/8000/1" ? 254 : 0);
+        logStartupPhase(QStringLiteral("音频设备/编解码"));
         pj::AccountConfig account;
         account.idUri = config.sipIdentity.toStdString();
         account.sipConfig.transportId = transportId;
@@ -546,10 +581,12 @@ bool BotEngine::start(const BotConfig &config)
         account.videoConfig.autoTransmitOutgoing = false;
         d.account = std::make_unique<Impl::Account>(&d);
         d.account->create(account, true);
+        logStartupPhase(QStringLiteral("SIP 账号创建"));
         d.running = true;
         d.pump.start();
         emit runningChanged(true);
         emit statusChanged(QStringLiteral("监听 SIP UDP %1:%2").arg(config.listenAddress).arg(config.sipPort));
+        emit logMessage(QStringLiteral("启动完成，总耗时 %1 ms").arg(startupTimer.elapsed()));
         return true;
     } catch (const pj::Error &e) { emit logMessage(QString::fromStdString(e.info())); }
       catch (const std::exception &e) { emit logMessage(QString::fromUtf8(e.what())); }
@@ -562,28 +599,45 @@ void BotEngine::stop()
     auto &d = *impl_;
     if (!d.created || d.stopping) return;
     d.stopping = true;
+    // 停止各阶段耗时诊断：用于定位按钮卡顿（日志中带毫秒）
+    QElapsedTimer stopTimer;
+    stopTimer.start();
+    qint64 stopMark = 0;
+    const auto logStopPhase = [&](const QString &name) {
+        const qint64 now = stopTimer.elapsed();
+        emit logMessage(QStringLiteral("停止阶段 %1：%2 ms").arg(name).arg(now - stopMark));
+        stopMark = now;
+    };
     d.pump.stop();
+    logStopPhase(QStringLiteral("停止事件泵"));
     for (auto it = d.calls.begin(); it != d.calls.end();) {
         auto c = (it++)->second;
         d.end(c);
     }
+    logStopPhase(QStringLiteral("结束通话"));
     // No Qt event pumping here: queued callbacks see an empty map afterwards.
     try {
         QElapsedTimer timer; timer.start();
         while (timer.elapsed() < 150) d.endpoint.libHandleEvents(10);
     } catch (const pj::Error &) {}
+    logStopPhase(QStringLiteral("SIP 事件排空"));
     d.calls.clear();
     if (d.account) {
         try { d.account->shutdown(); } catch (const pj::Error &) {}
         d.account.reset();
     }
-    try { d.endpoint.libDestroy(); }
+    logStopPhase(QStringLiteral("SIP 账号注销"));
+    // pjsua_destroy2(0) 在无注册账号时会固定忙等约 1 秒（等待反注册/传输收尾）。
+    // 这里账号已 shutdown 且只用 UDP，传 NO_RX_MSG 跳过这段无效等待，停止耗时从 ~1.1s 降到 ~0.2s。
+    try { d.endpoint.libDestroy(PJSUA_DESTROY_NO_RX_MSG); }
     catch (const pj::Error &e) { emit logMessage(QString::fromStdString(e.info())); }
+    logStopPhase(QStringLiteral("PJSUA 销毁"));
     d.created = d.running = d.stopping = false;
     d.config.apiKey.clear();
     d.config.sipPassword.clear();
     emit runningChanged(false);
     emit statusChanged(QStringLiteral("已停止"));
+    emit logMessage(QStringLiteral("停止完成，总耗时 %1 ms").arg(stopTimer.elapsed()));
 }
 void BotEngine::answer(int id)
 {

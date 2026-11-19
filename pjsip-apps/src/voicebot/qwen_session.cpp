@@ -1,6 +1,6 @@
 #include "qwen_session.h"
 
-#include "pcm_bridge.h"
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -23,6 +23,11 @@ constexpr qsizetype MaxInputBytes = 16000 * 2;
 constexpr qsizetype MaxOutputBytes = 24000 * 2 * 10;
 constexpr qsizetype MaxEncodedOutput = ((MaxOutputBytes + 2) / 3) * 4;
 constexpr qsizetype MaxPendingInterruptions = 128;
+// 响应看门狗：20s 无任何进展 / 45s 未收到 response.done 时兜底结束，避免无限挂起
+constexpr int ResponseProgressTimeoutMs = 20000;
+constexpr int ResponseDeadlineMs = 45000;
+// 告别话术兜底：发送后 30s 仍无 response.done 则强制结束
+constexpr int FarewellGuardMs = 30000;
 
 qint64 usageNumber(const QJsonObject &obj, const char *key)
 {
@@ -106,6 +111,23 @@ struct QwenSession::Impl : QObject {
                 silenceTimer.start();
             }
         });
+        // 响应看门狗：progress = 20s 无任何事件，deadline = 45s 未收到 response.done
+        responseProgress.setSingleShot(true);
+        responseProgress.setInterval(ResponseProgressTimeoutMs);
+        connect(&responseProgress, &QTimer::timeout, this, [this] { onResponseTimeout(false); });
+        responseDeadline.setSingleShot(true);
+        responseDeadline.setInterval(ResponseDeadlineMs);
+        connect(&responseDeadline, &QTimer::timeout, this, [this] { onResponseTimeout(true); });
+        // 告别话术兜底：话术发出后迟迟等不到 response.done 时强制结束
+        farewellGuard.setSingleShot(true);
+        farewellGuard.setInterval(FarewellGuardMs);
+        connect(&farewellGuard, &QTimer::timeout, this, [this] {
+            if (!farewellPending)
+                return;
+            farewellPending = false;
+            emit owner->diagLog(QStringLiteral("[farewell] 挂机话术 30 秒无响应，强制结束通话"));
+            requestEnd(QStringLiteral("挂机话术超时，强制结束通话"));
+        });
     }
 
     ~Impl() override { shutdown(); }
@@ -115,6 +137,9 @@ struct QwenSession::Impl : QObject {
     QTimer deadline;
     QTimer silenceTimer;
     QTimer drainTimer;
+    QTimer responseProgress; // 20s 无进展看门狗
+    QTimer responseDeadline; // 45s 未收到 response.done 看门狗
+    QTimer farewellGuard;    // 告别话术发送后的强制结束兜底
     State state = State::Closed;
     QString voice;
     QString instructions;
@@ -122,11 +147,13 @@ struct QwenSession::Impl : QObject {
     QString turnMode;
     QString activeResponse;
     QSet<QString> blockedResponses;
+    QHash<QString, int> blockedAudioDrops; // 被取消响应迟到音频增量计数（只统计，绝不入队）
     bool awaitingUserResponse = false;
     bool responseRequested = false;
     bool greetingRequested = false;
     bool greetingSent = false;
     bool allowBargeIn = true;
+    bool endRequestedSent = false;    // 结束请求只发一次
     int silenceTimeoutMs = 6000;
     int maxSilenceRetries = 3;
     int maxTurns = 40;
@@ -137,6 +164,7 @@ struct QwenSession::Impl : QObject {
     int maxHistoryTurns = 20;
     int silenceRetries = 0;
     int pendingToolCalls = 0; // 已上抛、尚未回传结果的工具调用数（挂起期间暂停无声计时）
+    bool deferredResponseCreate = false; // 工具结果到达时有响应进行中：延后到 response.done 再发起
     QJsonArray tools;         // 本次会话锁定的工具集快照
     bool endingCall = false;
     bool farewellPending = false;
@@ -150,6 +178,9 @@ struct QwenSession::Impl : QObject {
         deadline.stop();
         silenceTimer.stop();
         drainTimer.stop();
+        responseProgress.stop();
+        responseDeadline.stop();
+        farewellGuard.stop();
         if (socket) {
             socket->disconnect(this);
             socket->abort();
@@ -159,6 +190,7 @@ struct QwenSession::Impl : QObject {
         }
         activeResponse.clear();
         blockedResponses.clear();
+        blockedAudioDrops.clear();
         awaitingUserResponse = false;
         responseRequested = false;
         greetingRequested = false;
@@ -166,11 +198,13 @@ struct QwenSession::Impl : QObject {
         turnCount = 0;
         silenceRetries = 0;
         pendingToolCalls = 0;
+        deferredResponseCreate = false;
         endingCall = false;
         farewellPending = false;
         systemResponsePending = false;
         hangupAfterResponse = false;
         pendingSilenceStart = false;
+        endRequestedSent = false;
     }
 
     void fail(const QString &message)
@@ -180,6 +214,9 @@ struct QwenSession::Impl : QObject {
         state = State::Failed;
         deadline.stop();
         silenceTimer.stop();
+        responseProgress.stop();
+        responseDeadline.stop();
+        farewellGuard.stop();
         if (socket) {
             socket->disconnect(this);
             socket->abort();
@@ -233,14 +270,14 @@ struct QwenSession::Impl : QObject {
         send({{QStringLiteral("type"), QStringLiteral("response.create")}});
     }
 
-    void sendSystemPrompt(const QString &text)
+    bool sendSystemPrompt(const QString &text)
     {
         if (state != State::Ready ||
             responseRequested || awaitingUserResponse ||
             !activeResponse.isEmpty() || !blockedResponses.isEmpty())
-            return;
+            return false;
         if (text.trimmed().isEmpty())
-            return;
+            return false;
         systemResponsePending = true;
         responseRequested = true;
         const QJsonObject item{
@@ -251,18 +288,103 @@ struct QwenSession::Impl : QObject {
                 {QStringLiteral("text"), text}}}}};
         if (!send({{QStringLiteral("type"), QStringLiteral("conversation.item.create")},
                    {QStringLiteral("item"), item}}))
+            return false;
+        return send({{QStringLiteral("type"), QStringLiteral("response.create")}});
+    }
+
+    // 工具结果回传后发起新响应。服务端同一时刻只允许一个进行中的响应：
+    // 已有响应在跑（或 response.create 已发出、等待 response.created）时先延后，
+    // 等 response.done 再发——否则服务端返回 invalid_value
+    // "Cannot create response while another response is in progress." 并中断整通对话。
+    void requestResponseAfterTool()
+    {
+        // 用户正在说话：其语音轮次由服务端 VAD 提交后会自动创建响应，
+        // 工具结果此时已先进入会话历史，自动响应能看到它——不要手动抢建，
+        // 否则会撞上 "Server VAD turn committed but no response was created
+        // because a manual response is already in progress"。
+        if (awaitingUserResponse)
             return;
+        if (!activeResponse.isEmpty() || responseRequested) {
+            deferredResponseCreate = true;
+            emit owner->diagLog(QStringLiteral(
+                "[tool] 有响应进行中，工具结果的新响应延后到 response.done"));
+            return;
+        }
+        responseRequested = true;
         send({{QStringLiteral("type"), QStringLiteral("response.create")}});
+    }
+
+    // 统一的结束请求出口：只发一次，并停掉所有看门狗
+    void requestEnd(const QString &reason)
+    {
+        if (endRequestedSent)
+            return;
+        endRequestedSent = true;
+        farewellPending = false;
+        deferredResponseCreate = false;
+        responseProgress.stop();
+        responseDeadline.stop();
+        farewellGuard.stop();
+        emit owner->endRequested(reason);
     }
 
     void sendFarewell()
     {
+        if (farewellPending || endRequestedSent)
+            return;
+        endingCall = true;
         if (farewellPrompt.trimmed().isEmpty()) {
-            emit owner->endRequested(QStringLiteral("达到结束条件，挂断通话"));
+            requestEnd(QStringLiteral("达到结束条件，挂断通话"));
             return;
         }
         farewellPending = true;
-        sendSystemPrompt(farewellPrompt);
+        if (!sendSystemPrompt(farewellPrompt)) {
+            // 被进行中的响应/未完成的中断响应拒绝：endingCall 已使静音计时停摆，
+            // 必须直接结束，否则会永远挂在这里。
+            farewellPending = false;
+            emit owner->diagLog(QStringLiteral(
+                "[farewell] 告别话术未能发送（响应或工具仍在进行），直接结束通话"));
+            requestEnd(QStringLiteral("告别话术未能发送，直接结束通话"));
+            return;
+        }
+        // 话术已发出：即使服务端一直不回 response.done，也由兜底定时器强制结束
+        farewellGuard.start();
+    }
+
+    void onResponseTimeout(bool hardDeadline)
+    {
+        responseProgress.stop();
+        responseDeadline.stop();
+        if (state != State::Ready || endRequestedSent)
+            return;
+        if (endingCall || farewellPending) {
+            emit owner->diagLog(QStringLiteral("[watchdog] 结束流程中的响应超时，强制结束通话"));
+            requestEnd(QStringLiteral("响应超时，强制结束通话"));
+            return;
+        }
+        if (activeResponse.isEmpty())
+            return;
+        if (pendingToolCalls > 0) {
+            // 工具执行中：结果回传后模型会继续作答，重启进度计时而不是直接判超时。
+            // 到硬上限（45s）仍未回传说明工具本身卡死，此时必须结束，不能无限挂起。
+            if (!hardDeadline) {
+                responseProgress.start();
+            } else {
+                emit owner->diagLog(QStringLiteral(
+                    "[watchdog] 工具调用 %1 在 %2 秒内仍未回传，强制结束通话")
+                    .arg(pendingToolCalls).arg(ResponseDeadlineMs / 1000));
+                requestEnd(QStringLiteral("工具调用超时，强制结束通话"));
+            }
+            return;
+        }
+        emit owner->diagLog(QStringLiteral("[watchdog] 响应 %1 %2，主动结束通话")
+                                .arg(activeResponse,
+                                     hardDeadline ? QStringLiteral("45 秒内未完成")
+                                                  : QStringLiteral("20 秒无进展")));
+        // 丢弃迟到的增量；尝试一次告别话术，发送失败则由 sendFarewell 直接结束
+        activeResponse.clear();
+        emit owner->interrupted();
+        sendFarewell();
     }
 
     bool isCurrentResponse(const QJsonObject &event) const
@@ -271,10 +393,53 @@ struct QwenSession::Impl : QObject {
         return !id.isEmpty() && id == activeResponse && !blockedResponses.contains(id);
     }
 
+    void handleSpeechStarted()
+    {
+        if (endingCall)
+            return;
+        silenceRetries = 0;
+        silenceTimer.stop();
+        const bool playing = !activeResponse.isEmpty();
+        if (!allowBargeIn)
+            return; // 不打断模式：AI 正在说话时不处理用户语音（音频已在 appendAudio 丢弃）
+        if (!playing) {
+            awaitingUserResponse = true;
+            // Always clear local playback, even if response.done already arrived.
+            // VAD cancels server generation itself; response.cancel would race it.
+            emit owner->interrupted();
+            return;
+        }
+        // 全双工：收到 speech_started 立即取消当前响应（与 SIP 完全一致，不做延迟确认）
+        commitBargeIn();
+    }
+
+    void commitBargeIn()
+    {
+        awaitingUserResponse = true;
+        if (activeResponse.isEmpty() || endingCall)
+            return;
+        if (blockedResponses.size() >= MaxPendingInterruptions) {
+            fail(QStringLiteral("Qwen has too many unfinished interrupted responses."));
+            return;
+        }
+        blockedResponses.insert(activeResponse);
+        activeResponse.clear();
+        responseProgress.stop(); // 本轮已取消，看门狗不再对未完成的响应计时
+        responseDeadline.stop();
+        emit owner->diagLog(QStringLiteral("[barge] 收到 speech_started，立即中断当前播报"));
+        emit owner->interrupted();
+    }
+
     void receiveAudio(const QJsonObject &event)
     {
-        if (!isCurrentResponse(event))
+        if (!isCurrentResponse(event)) {
+            // 被取消响应（blockedResponses）的迟到 delta 只计数、绝不播放，
+            // 否则清队之后仍会漏进 playAudio，形成打断后的残音。
+            const QString id = event.value(QStringLiteral("response_id")).toString();
+            if (!id.isEmpty() && blockedResponses.contains(id))
+                ++blockedAudioDrops[id];
             return;
+        }
         const QJsonValue value = event.value(QStringLiteral("delta"));
         if (!value.isString()) {
             fail(QStringLiteral("Qwen sent an invalid audio delta."));
@@ -320,6 +485,9 @@ struct QwenSession::Impl : QObject {
             fail(QStringLiteral("Qwen audio delta is not valid 16-bit PCM Base64."));
             return;
         }
+        // 先更新状态再 emit：槽函数可能在信号栈内销毁本会话/停止播放，
+        // emit 返回后不得再访问任何成员（否则是 use-after-free）。
+        responseProgress.start(); // 有音频增量即视为响应有进展
         emit owner->audioReceived(decoded.decoded);
     }
 
@@ -347,6 +515,30 @@ struct QwenSession::Impl : QObject {
             // [debug-point evt-error] 保留服务端错误码，便于区分被拒原因（不含密钥）
             emit owner->diagLog(QStringLiteral("[server error] %1")
                 .arg(QString::fromUtf8(QJsonDocument(event).toJson(QJsonDocument::Compact))));
+            const QJsonObject errorObj = event.value(QStringLiteral("error")).toObject();
+            const QString errorParam = errorObj.value(QStringLiteral("param")).toString();
+            const QString errorText = errorObj.value(QStringLiteral("message")).toString();
+            // 并发 response.create 竞态：响应仍在进行中被拒绝。这不是会话故障，
+            // 延后到 response.done 重试即可，绝不能因本地时序问题中断整通电话。
+            if (errorParam == QStringLiteral("response.create") &&
+                errorText.contains(QStringLiteral("another response is in progress")) &&
+                !activeResponse.isEmpty()) {
+                responseRequested = false;
+                deferredResponseCreate = true;
+                emit owner->diagLog(QStringLiteral(
+                    "[tool] response.create 被并发响应拒绝，延后到 response.done 重试"));
+                return;
+            }
+            if (errorParam == QStringLiteral("input_audio_buffer.speech_stopped") &&
+                errorText.contains(QStringLiteral("no response was created"))) {
+                // 用户语音轮次已提交，但服务端因手动响应进行中没能自动创建响应。
+                // 这不是会话故障：等当前响应结束后主动补发一次，回答用户这一轮。
+                awaitingUserResponse = false;
+                deferredResponseCreate = true;
+                emit owner->diagLog(QStringLiteral(
+                    "[vad] 语音轮次提交时与手动响应冲突，当前响应结束后补发"));
+                return;
+            }
             fail(QStringLiteral("Qwen rejected a request or reported a server error."));
             return;
         }
@@ -398,24 +590,7 @@ struct QwenSession::Impl : QObject {
             emit owner->diagLog(QStringLiteral("[speech_started] activeResp=%1 ending=%2 allowBarge=%3")
                 .arg(activeResponse.isEmpty() ? QStringLiteral("no") : QStringLiteral("yes"))
                 .arg(endingCall ? 1 : 0).arg(allowBargeIn ? 1 : 0));
-            if (endingCall)
-                return;
-            silenceRetries = 0;
-            silenceTimer.stop();
-            if (!allowBargeIn && !activeResponse.isEmpty())
-                return; //不打断模式：AI 正在说话时不处理用户语音（音频已在 appendAudio 丢弃）
-            if (!activeResponse.isEmpty()) {
-                if (blockedResponses.size() >= MaxPendingInterruptions) {
-                    fail(QStringLiteral("Qwen has too many unfinished interrupted responses."));
-                    return;
-                }
-                blockedResponses.insert(activeResponse);
-                activeResponse.clear();
-            }
-            awaitingUserResponse = true;
-            // Always clear local playback, even if response.done already arrived.
-            // VAD cancels server generation itself; response.cancel would race it.
-            emit owner->interrupted();
+            handleSpeechStarted();
             return;
         }
         if (type == QStringLiteral("input_audio_buffer.speech_stopped")) {
@@ -424,6 +599,11 @@ struct QwenSession::Impl : QObject {
                 .arg(event.value(QStringLiteral("reason")).toString()));
             if (event.value(QStringLiteral("reason")).toString() == QStringLiteral("turn_invalid")) {
                 awaitingUserResponse = false;
+                // 本轮被服务端判定无效、不会自动创建响应：若有延后的工具结果响应，立即补发
+                if (deferredResponseCreate) {
+                    deferredResponseCreate = false;
+                    requestResponseAfterTool();
+                }
                 sendGreeting();
             }
             return;
@@ -445,6 +625,10 @@ struct QwenSession::Impl : QObject {
             if (blockedResponses.contains(id))
                 return;
             silenceTimer.stop();
+            // 用户语音轮次（VAD 自动创建）的响应开始：它创建于工具结果进入会话之后，
+            // 已包含全部工具输出，之前延后的补发请求不再需要。
+            if (deferredResponseCreate && awaitingUserResponse)
+                deferredResponseCreate = false;
             if (systemResponsePending) {
                 //系统发起的响应（静默提示/挂机话术），不计入对话轮次
                 systemResponsePending = false;
@@ -454,6 +638,10 @@ struct QwenSession::Impl : QObject {
                     endingCall = true;
             }
             activeResponse = id;
+            // 响应看门狗：20s 内无任何进展、45s 内未收到 response.done 都会兜底结束，
+            // 避免服务端沉默或断流时通话无限挂起。
+            responseProgress.start();
+            responseDeadline.start();
             awaitingUserResponse = false;
             responseRequested = false;
             return;
@@ -476,6 +664,7 @@ struct QwenSession::Impl : QObject {
             const QString callId = event.value(QStringLiteral("call_id")).toString();
             if (callId.isEmpty())
                 return; // 缺少 call_id 无法回传结果，只能放弃该轮
+            responseProgress.start(); // 工具调用到达即视为响应有进展
             ++pendingToolCalls;
             emit owner->toolCallRequested(callId,
                 event.value(QStringLiteral("name")).toString(),
@@ -496,6 +685,7 @@ struct QwenSession::Impl : QObject {
             type == QStringLiteral("response.text.done")) {
             if (!isCurrentResponse(event))
                 return;
+            responseProgress.start(); // 文本转写完成即视为响应有进展
             const QString text = event.value(type == QStringLiteral("response.text.done")
                 ? QStringLiteral("text") : QStringLiteral("transcript")).toString();
             if (!text.isEmpty())
@@ -507,9 +697,10 @@ struct QwenSession::Impl : QObject {
             const QString id = response.value(QStringLiteral("id")).toString();
             const QString status = response.value(QStringLiteral("status")).toString();
             // [debug-point response-done]
-            emit owner->diagLog(QStringLiteral("[response.done] id=%1 status=%2 wasActive=%3 blocked=%4")
+            emit owner->diagLog(QStringLiteral("[response.done] id=%1 status=%2 wasActive=%3 blocked=%4 droppedAudio=%5")
                 .arg(id, status).arg(id == activeResponse ? 1 : 0)
-                .arg(blockedResponses.contains(id) ? 1 : 0));
+                .arg(blockedResponses.contains(id) ? 1 : 0)
+                .arg(blockedAudioDrops.value(id)));
             if (status == QStringLiteral("failed")) {
                 fail(QStringLiteral("Qwen response generation failed."));
                 return;
@@ -524,9 +715,14 @@ struct QwenSession::Impl : QObject {
             if (usage.valid)
                 emit owner->usageUpdated(usage);
             const bool wasBlocked = blockedResponses.remove(id);
+            blockedAudioDrops.remove(id);
             const bool wasActive = id == activeResponse;
-            if (wasActive)
+            if (wasActive) {
                 activeResponse.clear();
+                // 本轮响应已完整结束，看门狗不再需要计时
+                responseProgress.stop();
+                responseDeadline.stop();
+            }
             if (!wasActive && !wasBlocked)
                 return;
             // A late cancellation for an old response must not erase new audio.
@@ -540,17 +736,26 @@ struct QwenSession::Impl : QObject {
                 return;
             if (farewellPending) {
                 farewellPending = false;
-                emit owner->endRequested(QStringLiteral("挂机话术播放完毕"));
+                requestEnd(QStringLiteral("挂机话术播放完毕"));
                 return;
             }
             if (hangupAfterResponse) {
                 hangupAfterResponse = false;
-                emit owner->endRequested(QStringLiteral("模型请求挂断电话"));
+                requestEnd(QStringLiteral("模型请求挂断电话"));
                 return;
             }
             if (endingCall) {
                 sendFarewell();
                 return;
+            }
+            // 工具结果在响应进行中到达时被延后：现在响应已结束，补发 response.create。
+            // 若用户正在说话（awaitingUserResponse），保留延后标记——服务端会为用户
+            // 这一轮自动创建响应（包含工具结果），response.created 时会清掉该标记；
+            // 若该轮被判无效（turn_invalid），在 speech_stopped 分支补发。
+            if (deferredResponseCreate && !awaitingUserResponse) {
+                deferredResponseCreate = false;
+                if (state == State::Ready)
+                    requestResponseAfterTool();
             }
             if (state == State::Ready) {
                 pendingSilenceStart = true;
@@ -726,7 +931,9 @@ void QwenSession::completeToolCall(const QString &callId, const QString &outputJ
     if (!d.send({{QStringLiteral("type"), QStringLiteral("conversation.item.create")},
                  {QStringLiteral("item"), item}}))
         return;
-    d.send({{QStringLiteral("type"), QStringLiteral("response.create")}});
+    // 多个工具结果可能并发回传；已有响应进行中时不能立即再发 response.create
+    // （服务端会以 "Cannot create response while another response is in progress" 拒绝）
+    d.requestResponseAfterTool();
 }
 
 } // namespace qwenbot

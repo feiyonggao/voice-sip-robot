@@ -14,7 +14,7 @@ struct CallRecord {
     QString callId;
     QString caller;
     QString callee;
-    QString modelId = QStringLiteral("qwen-audio-3.1-realtime-plus");
+    QString modelId; // 本次实际生效的模型，由写入方按配置/端点解析结果填充
     QString voice;
     QDateTime startTime;
     QDateTime answerTime;

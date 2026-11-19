@@ -2,6 +2,7 @@
 #include "mcp_client.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -11,10 +12,51 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStandardPaths>
+#include <QUrl>
 
 namespace qwenbot {
 namespace {
 constexpr qint64 kToolTimeoutMs = 10000; // 单次工具调用超时，超时把错误回给模型
+
+// stdio 插件源文件指纹：mtime + size + SHA-256。
+// 用于识别「配置未变，但同名插件文件被覆盖上传」的情况（HTTP 无本地文件，返回空串）。
+QString pluginFileStamp(const McpPluginSpec &spec)
+{
+    if (spec.isHttp()) return {};
+
+    const QStringList parts = QProcess::splitCommand(spec.command);
+    auto isScript = [](const QString &value) {
+        const QString lower = value.toLower();
+        return lower.endsWith(QStringLiteral(".py"))
+            || lower.endsWith(QStringLiteral(".js"))
+            || lower.endsWith(QStringLiteral(".mjs"));
+    };
+    QString path;
+    for (int i = 1; i < parts.size(); ++i) {
+        if (isScript(parts.at(i)) && QFileInfo(parts.at(i)).isFile()) {
+            path = parts.at(i);
+            break;
+        }
+    }
+    if (path.isEmpty() && !spec.name.contains(QLatin1Char('/'))
+        && !spec.name.contains(QLatin1Char('\\'))) {
+        const QString candidate = QDir(ToolRegistry::pluginsDir()).filePath(spec.name);
+        if (QFileInfo(candidate).isFile()) path = candidate;
+    }
+    if (path.isEmpty()) return {};
+
+    const QFileInfo info(path);
+    QString stamp = QStringLiteral("%1:%2")
+                        .arg(info.lastModified().toMSecsSinceEpoch())
+                        .arg(info.size());
+    QFile file(path);
+    if (file.open(QIODevice::ReadOnly) && file.size() <= 4LL * 1024 * 1024) {
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        if (hash.addData(&file))
+            stamp += QLatin1Char(':') + QString::fromLatin1(hash.result().toHex());
+    }
+    return stamp;
+}
 } // namespace
 
 ToolRegistry::ToolRegistry(QObject *parent) : QObject(parent)
@@ -44,43 +86,112 @@ void ToolRegistry::registerBuiltIn(const QString &name, const QString &descripti
     emit toolsChanged();
 }
 
-void ToolRegistry::applyMcpCommands(const QStringList &commands)
+void ToolRegistry::applyMcpPlugins(const QList<McpPluginSpec> &plugins)
 {
-    QStringList wanted;
-    for (const auto &raw : commands) {
-        const QString command = raw.trimmed();
-        if (!command.isEmpty() && !wanted.contains(command))
-            wanted.append(command);
+    QList<McpPluginSpec> wanted;
+    for (auto spec : plugins) {
+        spec.name = spec.name.trimmed();
+        spec.transport = spec.isHttp() ? QStringLiteral("http") : QStringLiteral("stdio");
+        if (spec.isHttp()) {
+            spec.url = spec.url.trimmed();
+            if (spec.name.isEmpty()) spec.name = labelForUrl(spec.url);
+            if (spec.url.isEmpty()) {
+                emit logMessage(QStringLiteral("MCP 插件 %1 缺少 HTTP 端点 URL，已跳过。")
+                                    .arg(spec.name));
+                continue;
+            }
+        } else {
+            spec.command = spec.command.trimmed();
+            if (spec.command.isEmpty())
+                spec.command = commandForPlugin(spec.name);
+            if (spec.command.isEmpty()) {
+                emit logMessage(QStringLiteral(
+                    "MCP 插件 %1 无法解析启动命令（文件不存在或解释器未安装），已跳过。")
+                                    .arg(spec.name.isEmpty() ? QStringLiteral("mcp") : spec.name));
+                continue;
+            }
+            if (spec.name.isEmpty()) spec.name = labelFor(spec.command);
+        }
+        const QString key = spec.key();
+        bool duplicate = false;
+        for (const auto &existing : wanted) {
+            if (existing.key() == key) { duplicate = true; break; }
+        }
+        if (duplicate) {
+            emit logMessage(QStringLiteral("MCP 插件 %1 重复配置，已忽略。").arg(spec.name));
+            continue;
+        }
+        wanted.append(spec);
     }
+
+    // stdio 插件的源文件指纹（HTTP 为空），用于识别同名文件被覆盖上传
+    QHash<QString, QString> wantedStamps;
+    for (const auto &spec : wanted)
+        wantedStamps.insert(spec.key(), pluginFileStamp(spec));
+
     bool changed = false;
     // 移除不再配置的插件（从后往前，避免索引失效）
     for (int i = int(servers_.size()) - 1; i >= 0; --i) {
-        if (!wanted.contains(servers_[i]->command)) {
+        bool keep = false;
+        for (const auto &spec : wanted)
+            keep = keep || servers_[i]->key == spec.key();
+        if (!keep) {
             emit logMessage(QStringLiteral("MCP 插件已停止：%1").arg(servers_[i]->label));
             shutdownServer(i);
             changed = true;
         }
     }
-    // 启动新配置的插件
-    for (const auto &command : wanted) {
-        bool exists = false;
-        for (const auto &server : servers_)
-            exists = exists || server->command == command;
-        if (!exists) {
-            createServer(command);
+    // 启动新配置的插件；同 key 的保持运行，但 stdio 插件文件被覆盖时需整进程重启
+    for (const auto &spec : wanted) {
+        int existing = -1;
+        for (int i = 0; i < int(servers_.size()); ++i) {
+            if (servers_[i]->key == spec.key()) { existing = i; break; }
+        }
+        if (existing < 0) {
+            createServer(spec);
+            changed = true;
+            continue;
+        }
+        if (spec.isHttp()) continue; // HTTP 无本地文件，不需要文件变更重启
+        const QString stamp = wantedStamps.value(spec.key());
+        if (!stamp.isEmpty() && servers_[existing]->sourceStamp != stamp) {
+            emit logMessage(QStringLiteral("插件文件已更新，正在重启子进程：%1")
+                                .arg(servers_[existing]->label));
+            shutdownServer(existing);
+            createServer(spec);
             changed = true;
         }
     }
+    // 来源被移除后，此前被其占名压住的同名工具应立即接替
+    if (rebuildToolSets())
+        changed = true;
     if (changed)
         emit toolsChanged();
 }
 
-void ToolRegistry::createServer(const QString &command)
+void ToolRegistry::applyMcpCommands(const QStringList &commands)
+{
+    QList<McpPluginSpec> plugins;
+    for (const auto &raw : commands) {
+        const QString command = raw.trimmed();
+        if (command.isEmpty()) continue;
+        McpPluginSpec spec;
+        spec.transport = QStringLiteral("stdio");
+        spec.command = command;
+        spec.name = labelFor(command);
+        plugins.append(spec);
+    }
+    applyMcpPlugins(plugins);
+}
+
+void ToolRegistry::createServer(const McpPluginSpec &spec)
 {
     auto server = std::make_unique<McpServer>();
-    server->command = command;
-    server->label = labelFor(command);
-    auto *client = new McpClient(server->label, command, this);
+    server->spec = spec;
+    server->key = spec.key();
+    server->label = spec.isHttp() ? labelForUrl(spec.url) : labelFor(spec.command);
+    server->sourceStamp = pluginFileStamp(spec);
+    auto *client = new McpClient(spec, this);
     server->client = client;
     connect(client, &McpClient::onlineChanged, this,
             [this, raw = server.get()](bool online, const QString &reason) {
@@ -115,17 +226,24 @@ void ToolRegistry::shutdownServer(int index)
 void ToolRegistry::handleServerOnline(McpServer *server)
 {
     server->online = true;
+    server->lastError.clear();
     emit logMessage(QStringLiteral("MCP 插件 %1 已连接。").arg(server->label));
     emit toolsChanged();
 }
 
 void ToolRegistry::handleServerOffline(McpServer *server, const QString &reason)
 {
-    const bool wasOnline = server->online || !server->tools.isEmpty();
+    const bool wasOnline = server->online || !server->tools.isEmpty()
+        || !server->ignored.isEmpty();
     server->online = false;
+    server->lastError = reason;
+    server->discovered.clear();
     server->tools.clear();
+    server->ignored.clear();
     failPendingForServer(server, QStringLiteral("MCP 插件不可用：%1").arg(reason));
-    if (wasOnline) {
+    // 该来源占用的名字被释放，其它来源的同名工具应自动接替
+    const bool reassigned = rebuildToolSets();
+    if (wasOnline || reassigned) {
         emit logMessage(QStringLiteral("MCP 插件 %1 离线：%2").arg(server->label, reason));
         emit toolsChanged();
     }
@@ -133,31 +251,91 @@ void ToolRegistry::handleServerOffline(McpServer *server, const QString &reason)
 
 void ToolRegistry::handleServerTools(McpServer *server)
 {
-    server->tools.clear();
-    for (const auto &desc : server->client->tools()) {
-        // 内置工具名与跨插件重名保护：先注册者优先
-        if (isBuiltIn(desc.name)) {
-            emit logMessage(QStringLiteral("MCP 插件 %1 的工具 %2 与内置工具重名，已忽略。")
-                                .arg(server->label, desc.name));
-            continue;
-        }
-        McpServer *owner = findServerForTool(desc.name);
-        if (owner && owner != server) {
-            emit logMessage(QStringLiteral("MCP 插件 %1 的工具 %2 与其他插件重名，已忽略。")
-                                .arg(server->label, desc.name));
-            continue;
-        }
-        server->tools.append({desc.name, desc.description, server->label,
-                              desc.parameters, false, true});
+    server->discovered = server->client->tools();
+    rebuildToolSets();
+    QStringList names;
+    for (const auto &tool : server->tools) names.append(tool.name);
+    QString ignoredText;
+    if (!server->ignored.isEmpty()) {
+        QStringList ignoredNames;
+        for (const auto &item : server->ignored)
+            ignoredNames.append(QStringLiteral("%1（与 %2 同名）").arg(item.name, item.owner));
+        ignoredText = QStringLiteral("；%1 个工具因重名未注册：%2")
+                          .arg(server->ignored.size())
+                          .arg(ignoredNames.join(QStringLiteral(", ")));
     }
-    emit logMessage(QStringLiteral("MCP 插件 %1 提供 %2 个工具：%3")
+    emit logMessage(QStringLiteral("MCP 插件 %1 提供 %2 个工具：%3%4")
                         .arg(server->label).arg(server->tools.size())
-                        .arg([this, server] {
-                            QStringList names;
-                            for (const auto &tool : server->tools) names.append(tool.name);
-                            return names.join(QStringLiteral(", "));
-                        }()));
+                        .arg(names.join(QStringLiteral(", ")), ignoredText));
     emit toolsChanged();
+}
+
+bool ToolRegistry::rebuildToolSets()
+{
+    bool changed = false;
+    QHash<QString, QString> claimed; // 工具名 → 占名来源展示名
+    for (const auto &tool : builtins_)
+        claimed.insert(tool.name, QStringLiteral("内置工具"));
+    QSet<QString> currentConflicts;
+    for (auto &server : servers_) {
+        QList<Tool> effective;
+        QList<IgnoredTool> ignored;
+        if (server->online) {
+            for (const auto &desc : server->discovered) {
+                const QString owner = claimed.value(desc.name);
+                if (!owner.isEmpty()) {
+                    ignored.append({desc.name, desc.description, owner});
+                    continue;
+                }
+                // server 字段用配置名而非展示名：GUI 的传输方式/来源查找都以
+                // tools/plugin/<名称> 为键，远端展示名（主机名）会导致查不到而误显示 stdio
+                claimed.insert(desc.name, server->spec.name);
+                effective.append({desc.name, desc.description, server->spec.name,
+                                  desc.parameters, false, true});
+            }
+        }
+        // 工具集是否变化以名称序列为准（说明文字变化不影响模型快照的可用性判断）
+        auto sameNames = [](const QList<Tool> &lhs, const QList<Tool> &rhs) {
+            if (lhs.size() != rhs.size()) return false;
+            for (int i = 0; i < lhs.size(); ++i)
+                if (lhs.at(i).name != rhs.at(i).name) return false;
+            return true;
+        };
+        if (!sameNames(server->tools, effective))
+            changed = true;
+        const QList<IgnoredTool> previous = server->ignored;
+        server->tools = effective;
+        server->ignored = ignored;
+        // 冲突日志只记一次；冲突解除（占名来源离线/被移除）时补一条启用记录
+        for (const auto &item : ignored) {
+            const QString key = server->key + QLatin1Char('\x1f') + item.name
+                                + QLatin1Char('\x1f') + item.owner;
+            currentConflicts.insert(key);
+            if (!conflictLogged_.contains(key)) {
+                emit logMessage(QStringLiteral(
+                    "MCP 插件 %1 的工具 %2 与 %3 的同名工具冲突，已忽略；"
+                    "移除或停用 %3 后会自动启用该工具。")
+                                    .arg(server->label, item.name, item.owner));
+            }
+        }
+        if (server->online) {
+            for (const auto &old : previous) {
+                bool stillIgnored = false;
+                for (const auto &item : ignored)
+                    stillIgnored = stillIgnored || item.name == old.name;
+                bool nowActive = false;
+                for (const auto &tool : effective)
+                    nowActive = nowActive || tool.name == old.name;
+                if (!stillIgnored && nowActive) {
+                    emit logMessage(QStringLiteral(
+                        "MCP 插件 %1 的工具 %2 重名冲突已解除，已启用。")
+                                        .arg(server->label, old.name));
+                }
+            }
+        }
+    }
+    conflictLogged_ = currentConflicts;
+    return changed;
 }
 
 void ToolRegistry::handleClientResult(McpServer *server, int requestId,
@@ -219,12 +397,16 @@ QJsonArray ToolRegistry::toolsJson() const
                 {QStringLiteral("parameters"), parameters}}}};
     };
     QJsonArray array;
-    for (const auto &tool : builtins_)
+    for (const auto &tool : builtins_) {
+        if (disabledTools_.contains(tool.name)) continue; // 工具级禁用：不进新通话的工具集
         array.append(encode(tool));
+    }
     for (const auto &server : servers_) {
         if (!server->online) continue; // 离线插件不进 tools，避免模型调用必失败
-        for (const auto &tool : server->tools)
+        for (const auto &tool : server->tools) {
+            if (disabledTools_.contains(tool.name)) continue;
             array.append(encode(tool));
+        }
     }
     return array;
 }
@@ -241,6 +423,37 @@ QList<ToolRegistry::Tool> ToolRegistry::tools() const
     return result;
 }
 
+QList<ToolRegistry::PluginState> ToolRegistry::pluginStates() const
+{
+    QList<PluginState> result;
+    for (const auto &server : servers_) {
+        result.append({server->spec.name, server->label, server->online,
+                       server->spec.isHttp() ? QStringLiteral("http")
+                                             : QStringLiteral("stdio"),
+                       server->lastError, server->tools, server->ignored});
+    }
+    return result;
+}
+
+void ToolRegistry::setDisabledTools(const QStringList &names)
+{
+    QSet<QString> wanted;
+    for (const auto &raw : names) {
+        const QString name = raw.trimmed();
+        if (!name.isEmpty()) wanted.insert(name);
+    }
+    // 不发射 toolsChanged：禁用只影响下一次通话的 toolsJson() 快照，
+    // 也不需要在 GUI 中重建表格（避免在开关自身信号里销毁控件）。
+    disabledTools_ = wanted;
+}
+
+QStringList ToolRegistry::disabledTools() const
+{
+    QStringList names = QStringList(disabledTools_.begin(), disabledTools_.end());
+    names.sort();
+    return names;
+}
+
 bool ToolRegistry::isBuiltIn(const QString &name) const
 {
     for (const auto &tool : builtins_)
@@ -254,14 +467,6 @@ int ToolRegistry::pendingMcpCount() const
     for (const auto &server : servers_)
         count += server->online ? 0 : 1;
     return count;
-}
-
-ToolRegistry::McpServer *ToolRegistry::findServerForTool(const QString &name)
-{
-    for (const auto &server : servers_)
-        for (const auto &tool : server->tools)
-            if (tool.name == name) return server.get();
-    return nullptr;
 }
 
 int ToolRegistry::callMcpTool(const QString &name, const QJsonObject &arguments)
@@ -386,6 +591,17 @@ QStringList ToolRegistry::pluginDependencies(const QString &fileName)
             result.append(name);
     result.sort();
     return result;
+}
+
+QString ToolRegistry::labelForUrl(const QString &url)
+{
+    const QUrl parsed(url);
+    const QString authority = parsed.authority();
+    if (authority.isEmpty())
+        return url.isEmpty() ? QStringLiteral("mcp-http") : url;
+    const QString path = parsed.path();
+    return path.isEmpty() || path == QStringLiteral("/")
+        ? authority : authority + path;
 }
 
 QString ToolRegistry::labelFor(const QString &command)

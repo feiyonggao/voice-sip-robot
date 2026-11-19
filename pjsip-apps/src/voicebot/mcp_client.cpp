@@ -1,28 +1,48 @@
 #include "mcp_client.h"
+#include "mcp_transport.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
-#include <QJsonParseError>
 #include <QProcess>
-
-#ifdef Q_OS_WIN
-#ifndef CREATE_NO_WINDOW
-#define CREATE_NO_WINDOW 0x08000000
-#endif
-#endif
+#include <QUrl>
 
 namespace qwenbot {
 namespace {
 constexpr qint64 kHandshakeTimeoutMs = 10000; // 握手+工具发现超时
 constexpr qint64 kCallTimeoutMs = 10000;      // 单次工具调用超时
 constexpr qint64 kReconnectMs = 5000;         // 断线重连退避
-constexpr int kMaxLineBytes = 1024 * 1024;    // 单行消息上限
+constexpr qint64 kSessionRetryBaseMs = 1000;  // 会话失效后重新初始化退避基数
+constexpr int kMaxSessionRecoveryAttempts = 4; // 重新初始化最大尝试次数
 constexpr int kMaxOutputChars = 4000;         // 回传给模型的工具输出上限
-constexpr int kMaxStderrLine = 500;           // 子进程 stderr 单行日志截断
+
+QString pluginLabel(const McpPluginSpec &spec)
+{
+    if (spec.isHttp()) {
+        const QUrl url(spec.url);
+        const QString host = url.host();
+        const QString path = url.path();
+        if (!host.isEmpty())
+            return path.isEmpty() || path == QStringLiteral("/")
+                ? host : host + path;
+        return spec.url;
+    }
+    const QStringList parts = QProcess::splitCommand(spec.command);
+    if (parts.isEmpty()) return spec.name.isEmpty() ? QStringLiteral("mcp") : spec.name;
+    QString name = parts.constFirst();
+    static const QStringList interpreters = {
+        QStringLiteral("python"), QStringLiteral("python3"), QStringLiteral("py"),
+        QStringLiteral("node"), QStringLiteral("deno"), QStringLiteral("bun")};
+    if (parts.size() > 1 && interpreters.contains(name.toLower()))
+        name = parts.at(1);
+    const int slash = qMax(name.lastIndexOf(QLatin1Char('/')),
+                           name.lastIndexOf(QLatin1Char('\\')));
+    if (slash >= 0) name = name.mid(slash + 1);
+    return name.isEmpty() ? QStringLiteral("mcp") : name;
+}
 } // namespace
 
-McpClient::McpClient(const QString &label, const QString &command, QObject *parent)
-    : QObject(parent), label_(label), command_(command)
+McpClient::McpClient(const McpPluginSpec &spec, QObject *parent)
+    : QObject(parent), spec_(spec), label_(pluginLabel(spec))
 {
     clock_.start();
     deadlineTimer_.setInterval(500);
@@ -30,6 +50,8 @@ McpClient::McpClient(const QString &label, const QString &command, QObject *pare
     deadlineTimer_.start();
     reconnectTimer_.setSingleShot(true);
     connect(&reconnectTimer_, &QTimer::timeout, this, &McpClient::start);
+    sessionRetryTimer_.setSingleShot(true);
+    connect(&sessionRetryTimer_, &QTimer::timeout, this, &McpClient::retryInitialize);
 }
 
 McpClient::~McpClient()
@@ -38,88 +60,64 @@ McpClient::~McpClient()
     reconnectTimer_.stop();
     deadlineTimer_.stop();
     failPendingCalls(QStringLiteral("MCP 插件已停止"));
-    cleanupProcess();
+    cleanupTransport();
 }
 
 void McpClient::start()
 {
     if (shuttingDown_) return;
+    sessionRetryTimer_.stop();
+    sessionRecoveryActive_ = false;
+    sessionRecoveryAttempts_ = 0;
     failPendingCalls(QStringLiteral("MCP 插件正在重启"));
-    cleanupProcess();
-    readBuf_.clear();
+    cleanupTransport();
     tools_.clear();
     online_ = false;
 
-    const QStringList parts = QProcess::splitCommand(command_);
-    if (parts.isEmpty() || parts.constFirst().isEmpty()) {
-        emit logMessage(QStringLiteral("MCP 插件 %1 的启动命令为空，无法执行。").arg(label_));
-        return;
+    if (spec_.isHttp()) {
+        transport_ = new McpHttpTransport(spec_.url, spec_.headers, this);
+        // 曾经成功建立过 Streamable 会话的端点，后续重连不允许再回退旧版 SSE
+        if (streamableSessionSeen_)
+            transport_->setLegacyFallbackAllowed(false);
+    } else {
+        transport_ = new McpStdioTransport(spec_.command, this);
     }
-    auto *process = new QProcess(this);
-    process_ = process;
-#ifdef Q_OS_WIN
-    // GUI 程序下拉起控制台子进程会弹出黑色窗口，需隐藏
-    process->setCreateProcessArgumentsModifier(
-        [](QProcess::CreateProcessArguments *args) { args->flags |= CREATE_NO_WINDOW; });
-#endif
-    process->setProgram(parts.constFirst());
-    process->setArguments(parts.mid(1));
-    connect(process, &QProcess::readyReadStandardOutput, this, &McpClient::readStdout);
-    connect(process, &QProcess::readyReadStandardError, this, [this, process] {
-        for (const auto &line : process->readAllStandardError().split('\n')) {
-            const QString text = QString::fromUtf8(line.trimmed());
-            if (!text.isEmpty())
-                emit logMessage(QStringLiteral("MCP 插件 %1：%2")
-                                    .arg(label_, text.left(kMaxStderrLine)));
-        }
-    });
-    connect(process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
-        QString reason = QStringLiteral("进程错误 %1").arg(int(error));
-        if (error == QProcess::FailedToStart) {
-            reason = QStringLiteral("无法启动（请检查命令与解释器是否可用）");
-            // 首次启动失败不会经过 online 状态，必须直接记日志否则无任何可见线索
-            emit logMessage(QStringLiteral("MCP 插件 %1 %2").arg(label_, reason));
-        }
-        handleProcessExit(reason);
-    });
-    connect(process, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus status) {
-        handleProcessExit(QStringLiteral("进程退出（code=%1，%2）")
-                              .arg(exitCode).arg(status == QProcess::CrashExit
-                                                     ? QStringLiteral("异常终止")
-                                                     : QStringLiteral("正常退出")));
-    });
-    startedMs_ = clock_.elapsed();
-    process->start();
-    emit logMessage(QStringLiteral("MCP 插件 %1 启动：%2").arg(label_, command_));
-    sendInitialize();
+    connect(transport_, &McpTransport::ready, this, &McpClient::sendInitialize);
+    connect(transport_, &McpTransport::messageReceived, this, &McpClient::handleMessage);
+    connect(transport_, &McpTransport::failed, this, &McpClient::handleTransportFailure);
+    connect(transport_, &McpTransport::logMessage, this, &McpClient::logMessage);
+    connect(transport_, &McpTransport::sessionExpired, this, &McpClient::handleSessionExpired);
+    lastInitializeMs_ = clock_.elapsed();
+    transport_->start();
 }
 
 void McpClient::shutdown()
 {
     shuttingDown_ = true;
     reconnectTimer_.stop();
+    sessionRetryTimer_.stop();
+    sessionRecoveryActive_ = false;
+    sessionRecoveryAttempts_ = 0;
     failPendingCalls(QStringLiteral("MCP 插件已停止"));
-    cleanupProcess();
+    cleanupTransport();
     online_ = false;
 }
 
 bool McpClient::send(const QJsonObject &event)
 {
-    if (!process_ || process_->state() == QProcess::NotRunning)
-        return false;
-    QByteArray frame = QJsonDocument(event).toJson(QJsonDocument::Compact);
-    frame.append('\n');
-    return process_->write(frame) == frame.size();
+    return transport_ && transport_->isRunning() && transport_->send(event);
 }
 
 void McpClient::sendInitialize()
 {
     initRequestId_ = nextRequestId_++;
+    lastInitializeMs_ = clock_.elapsed();
     send({{QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
           {QStringLiteral("id"), initRequestId_},
           {QStringLiteral("method"), QStringLiteral("initialize")},
           {QStringLiteral("params"), QJsonObject{
-              {QStringLiteral("protocolVersion"), QStringLiteral("2024-11-05")},
+              {QStringLiteral("protocolVersion"),
+               transport_ ? transport_->protocolVersion() : QStringLiteral("2024-11-05")},
               {QStringLiteral("capabilities"), QJsonObject{}},
               {QStringLiteral("clientInfo"), QJsonObject{
                   {QStringLiteral("name"), QStringLiteral("voicebot")},
@@ -137,7 +135,7 @@ void McpClient::sendToolsList()
 
 int McpClient::callTool(const QString &name, const QJsonObject &arguments)
 {
-    if (!online_ || !process_ || process_->state() != QProcess::Running)
+    if (!online_ || !transport_ || !transport_->isRunning())
         return -1;
     const int requestId = nextRequestId_++;
     calls_.insert(requestId, {name, clock_.elapsed() + kCallTimeoutMs});
@@ -154,36 +152,8 @@ int McpClient::callTool(const QString &name, const QJsonObject &arguments)
     return requestId;
 }
 
-void McpClient::readStdout()
+void McpClient::handleMessage(const QJsonObject &message)
 {
-    if (!process_) return;
-    readBuf_.append(process_->readAllStandardOutput());
-    while (true) {
-        const int newline = readBuf_.indexOf('\n');
-        if (newline < 0) {
-            if (readBuf_.size() > kMaxLineBytes) {
-                // 违反 stdio 帧格式（单行超限），视为插件故障，重启进程
-                emit logMessage(QStringLiteral("MCP 插件 %1 输出单行超限，重启进程。").arg(label_));
-                handleProcessExit(QStringLiteral("输出帧超限"));
-            }
-            return;
-        }
-        const QByteArray line = readBuf_.left(newline);
-        readBuf_.remove(0, newline + 1);
-        if (!line.trimmed().isEmpty())
-            handleLine(line);
-    }
-}
-
-void McpClient::handleLine(const QByteArray &line)
-{
-    QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(line, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
-        emit logMessage(QStringLiteral("MCP 插件 %1 发来无法解析的行，已忽略。").arg(label_));
-        return;
-    }
-    const QJsonObject message = document.object();
     const QString method = message.value(QStringLiteral("method")).toString();
     const QJsonValue idValue = message.value(QStringLiteral("id"));
     const bool hasId = idValue.isDouble();
@@ -217,12 +187,43 @@ void McpClient::handleResponse(int requestId, const QJsonObject &result,
             emit logMessage(QStringLiteral("MCP 插件 %1 initialize 被拒绝：%2")
                                 .arg(label_, QString::fromUtf8(
                                     QJsonDocument(error).toJson(QJsonDocument::Compact))));
-            handleProcessExit(QStringLiteral("initialize 失败"));
+            // 会话失效后的重新握手失败：按指数退避重试，不立即拆通道
+            if (sessionRecoveryActive_) {
+                ++sessionRecoveryAttempts_;
+                if (sessionRecoveryAttempts_ <= kMaxSessionRecoveryAttempts) {
+                    const qint64 delay = qMin<qint64>(
+                        kSessionRetryBaseMs * (qint64(1) << (sessionRecoveryAttempts_ - 1)), 15000);
+                    emit logMessage(QStringLiteral(
+                        "MCP 插件 %1 重新初始化失败（第 %2 次），%3 ms 后重试。")
+                                        .arg(label_)
+                                        .arg(sessionRecoveryAttempts_)
+                                        .arg(delay));
+                    sessionRetryTimer_.start(int(delay));
+                    return;
+                }
+                emit logMessage(QStringLiteral(
+                    "MCP 插件 %1 多次重新初始化失败，进入正常重连退避。").arg(label_));
+                sessionRecoveryActive_ = false;
+                sessionRecoveryAttempts_ = 0;
+            }
+            // 把服务端/传输层的具体原因（如 Connection refused、HTTP 401）带到界面状态
+            const QString detail = error.value(QStringLiteral("message")).toString();
+            handleTransportFailure(detail.isEmpty()
+                ? QStringLiteral("initialize 失败") : detail);
             return;
         }
-        // 握手完成：发送 initialized 通知并发现工具
+        // 握手完成：发送 initialized 通知、标记会话已建立并发现工具
         send({{QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
               {QStringLiteral("method"), QStringLiteral("notifications/initialized")}});
+        if (spec_.isHttp() && transport_ && !transport_->isLegacy())
+            streamableSessionSeen_ = true;
+        if (transport_) {
+            transport_->markSessionEstablished();
+            transport_->startServerMessages();
+        }
+        sessionRetryTimer_.stop();
+        sessionRecoveryActive_ = false;
+        sessionRecoveryAttempts_ = 0;
         sendToolsList();
         return;
     }
@@ -265,16 +266,44 @@ void McpClient::handleResponse(int requestId, const QJsonObject &result,
     // 未知 ID：超时后迟到的结果，忽略
 }
 
-void McpClient::handleProcessExit(const QString &reason)
+void McpClient::handleSessionExpired()
 {
+    if (shuttingDown_ || !spec_.isHttp() || !transport_ || sessionRecoveryActive_)
+        return;
+    sessionRecoveryActive_ = true;
+    sessionRecoveryAttempts_ = 0;
+    const bool wasOnline = online_;
+    online_ = false;
+    tools_.clear();
+    failPendingCalls(QStringLiteral("MCP 会话已失效，正在重新初始化"));
+    emit logMessage(QStringLiteral("MCP 插件 %1 会话已失效，正在重新初始化。").arg(label_));
+    if (wasOnline)
+        emit onlineChanged(false, QStringLiteral("会话已失效，正在重新初始化"));
+    // 清空本地会话（session id / 主动消息流），重新走 initialize
+    transport_->resetSession();
+    sessionRetryTimer_.start(0);
+}
+
+void McpClient::retryInitialize()
+{
+    if (shuttingDown_ || !sessionRecoveryActive_ || !transport_ || !transport_->isRunning())
+        return;
+    sendInitialize();
+}
+
+void McpClient::handleTransportFailure(const QString &reason)
+{
+    sessionRetryTimer_.stop();
+    sessionRecoveryActive_ = false;
+    sessionRecoveryAttempts_ = 0;
     if (shuttingDown_) {
-        cleanupProcess();
+        cleanupTransport();
         return;
     }
     const bool wasOnline = online_;
     online_ = false;
     failPendingCalls(QStringLiteral("MCP 插件不可用（%1）").arg(reason));
-    cleanupProcess();
+    cleanupTransport();
     if (wasOnline)
         emit logMessage(QStringLiteral("MCP 插件 %1 掉线：%2").arg(label_, reason));
     emit onlineChanged(false, reason);
@@ -289,30 +318,28 @@ void McpClient::failPendingCalls(const QString &error)
     calls_.clear();
 }
 
-void McpClient::cleanupProcess()
+void McpClient::cleanupTransport()
 {
-    if (!process_) return;
-    auto *process = process_;
-    process_ = nullptr;
-    process->disconnect(this);
-    if (process->state() != QProcess::NotRunning) {
-        process->kill();
-        process->waitForFinished(1500);
-    }
-    process->deleteLater();
+    if (!transport_) return;
+    auto *transport = transport_;
+    transport_ = nullptr;
+    transport->disconnect(this);
+    transport->stop();
+    transport->deleteLater();
 }
 
 void McpClient::sweepTimeouts()
 {
     const qint64 now = clock_.elapsed();
-    // 握手超时：杀掉进程，走重连流程
-    if (!online_ && process_ && process_->state() != QProcess::NotRunning &&
-        now - startedMs_ > kHandshakeTimeoutMs) {
+    // 握手超时：终止当前通道，走重连流程（退避等待期间不计时）
+    if (!online_ && transport_ && transport_->isRunning()
+        && !sessionRetryTimer_.isActive()
+        && now - lastInitializeMs_ > kHandshakeTimeoutMs) {
         emit logMessage(QStringLiteral("MCP 插件 %1 握手超时（10 秒）。").arg(label_));
-        handleProcessExit(QStringLiteral("握手超时"));
+        handleTransportFailure(QStringLiteral("握手超时"));
         return;
     }
-    // 工具调用超时：把错误回传给模型，不杀进程（可能只是单次执行慢）
+    // 工具调用超时：把错误回传给模型，不重启通道（可能只是单次执行慢）
     for (auto it = calls_.begin(); it != calls_.end();) {
         if (it->deadlineMs > now) { ++it; continue; }
         const int requestId = it.key();
